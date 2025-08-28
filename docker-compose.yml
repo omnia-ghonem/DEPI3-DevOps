@@ -1,0 +1,59 @@
+services:
+  php:
+    container_name: php
+    image: php:8.2-apache
+    build: ./php
+    networks:
+      - backend_net
+
+  nginx1:
+    container_name: nginx1
+    image: nginx:latest
+    build: ./nginx1
+    ports:
+      - '8082:8080'
+    networks:
+      - lb_net
+
+  nginx2:
+    container_name: nginx2
+    image: nginx:latest
+    build: ./nginx2
+    ports:
+      - '8083:8081'
+    networks:
+      - lb_net
+
+  frontend:
+    container_name: frontend
+    image: nginx:latest
+    build: ./frontend
+    depends_on:
+      - nginx2
+    ports:
+      - '90:90'
+    networks:
+      - frontend_net
+
+  lb:
+    container_name: lb
+    image: nginx:alpine
+    build: ./lb
+    depends_on:
+      - nginx1
+      - nginx2
+    ports:
+      - '8084:80'
+    networks:
+      - lb_net
+
+networks:
+  backend_net:
+    name: backend_net
+    driver: bridge
+  frontend_net:
+    name: frontend_net
+    driver: bridge
+  lb_net:
+    name: lb_net
+    driver: bridge
