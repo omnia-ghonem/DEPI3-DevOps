@@ -1,0 +1,106 @@
+services:
+  load-balancer:
+    container_name: load-balancer
+    build: ./loadbalancer-scale
+    depends_on:
+      - web
+    ports:
+      - '8060:8020'
+    volumes:
+      - ./loadbalancer-scale/Configuration/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - port-network
+
+  web:
+    build: ./nginx-port
+    depends_on:
+      - php-port
+    ports:
+      - '8050'
+    volumes:
+      - ./nginx-port/html/:/usr/share/nginx/html/
+      - ./nginx-port/configuration/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - port-network
+
+  php-port:
+    container_name: php-port
+    build: ./php-port
+    volumes:
+      - ./php-port/html/:/var/www/html/
+      - ./php-port/www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
+    networks:
+      port-network:
+        ipv4_address: 172.35.0.2
+
+  nginx-mysql-db:
+    container_name: nginx-mysql-db
+    image: mysql:latest
+    ports:
+      - '3306'
+    volumes:
+      - my_sql_volume:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: petclinic
+      MYSQL_USER: petclinic
+      MYSQL_PASSWORD: petclinic
+    networks:
+      - petclinic-compose-mysql
+
+  nginx-postgres-db:
+    container_name: nginx-postgres-db
+    image: postgres:latest
+    ports:
+      - '5432'
+    volumes:
+      - postgres_volume:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: petclinic
+      POSTGRES_USER: petclinic
+      POSTGRES_PASSWORD: petclinic
+    networks:
+      - petclinic-compose-postgres
+
+  nginx-mysql:
+    container_name: nginx-mysql
+    build: ./MySql
+    depends_on:
+      - nginx-mysql-db
+    ports:
+      - '8090:8080'
+    environment:
+      - MYSQL_URL=jdbc:mysql://nginx-mysql-db:3306/petclinic \
+      - MYSQL_USER=petclinic
+      - MYSQL_PASS=petclinic
+    networks:
+      - petclinic-compose-mysql
+
+  nginx-postgres:
+    container_name: nginx-postgres
+    build: ./Postgres
+    depends_on:
+      - nginx-postgres-db
+    ports:
+      - '8070:8080'
+    environment:
+      - POSTGRES_URL=jdbc:postgresql://nginx-postgres-db:5432/petclinic
+      - POSTGRES_USER=petclinic
+      - POSTGRES_PASSWORD=petclinic
+    networks:
+      - petclinic-compose-postgres
+
+volumes:
+  my_sql_volume: null
+  postgres_volume: null
+
+networks:
+  port-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.35.0.0/16
+  petclinic-compose-mysql:
+    driver: bridge
+  petclinic-compose-postgres:
+    driver: bridge

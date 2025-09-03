@@ -1,0 +1,13 @@
+services:
+  nginx-web:
+    build: ./nginx-web-app
+    ports:
+      - '8082'
+    volumes:
+      - ./html-volume:/usr/share/nginx/html
+    networks:
+      - public_net
+
+networks:
+  public_net:
+    driver: bridge
