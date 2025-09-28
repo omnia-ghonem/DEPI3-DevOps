@@ -1,6 +1,0 @@
-- hosts: local
-  become: true
-  roles:
-    - nginx_php_port
-    - nginx_php_socket
-    - nginx_lb
