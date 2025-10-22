@@ -1,0 +1,546 @@
+  # tasks file for kubernetes_master (CentOS 10)
+- name: Install Kubernetes Master Node
+  hosts: master
+  become: true
+  vars:
+    ansible_user: ansible
+    kube_user_home: /home/ansible
+    kubeconfig_path: /home/ansible/.kube/config
+    pod_network_cidr: "10.244.0.0/16"
+    calico_manifest: "https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml"
+  tasks:
+      - name: Remove old versions
+        yum:
+          name: "{{ pkg }}"
+          state: absent
+          disablerepo: docker-ce-stable
+        loop:
+          - docker
+          - docker-client
+          - docker-client-latest
+          - docker-common
+          - docker-latest
+          - docker-latest-logrotate
+          - docker-logrotate
+          - docker-engine
+          - runc
+          - podman
+          - kube*
+        loop_control:
+          loop_var: pkg
+
+      - name: Install required packages
+        yum:
+          name:
+            - curl
+            - gnupg2
+            - yum-utils
+            - dnf
+            - iproute-tc
+            - device-mapper-persistent-data
+            - lvm2
+            - ca-certificates
+          state: present
+
+      - name: Set up Docker repository
+        ansible.builtin.yum_repository:
+          name: docker-ce-stable
+          description: Docker CE Stable - $basearch
+          baseurl: https://download.docker.com/linux/centos/10/$basearch/stable
+          gpgcheck: yes
+          gpgkey: https://download.docker.com/linux/centos/gpg
+          enabled: yes
+
+      - name: Install Docker
+        yum:
+          name:
+            - docker-ce
+            - docker-ce-cli
+            - containerd.io
+            - docker-buildx-plugin
+            - docker-compose-plugin
+            - docker-ce-rootless-extras
+          state: present
+
+      - name: Start and enable Docker
+        ansible.builtin.systemd:
+          name: docker
+          enabled: true
+          state: started
+
+
+      - name: Configure Docker daemon.json(overwrite)
+        ansible.builtin.copy:
+          dest: /etc/docker/daemon.json
+          content: |
+            {
+              "exec-opts": ["native.cgroupdriver=systemd"],
+              "log-driver": "json-file",
+              "log-opts": {
+                "max-size": "100m"
+              }
+            }
+        notify: Restart-docker
+
+      - name: Disable swap
+        ansible.builtin.command: swapoff -a
+
+      - name: Comment out all swap entries in /etc/fstab(disables swap permanently for Kubernetes nodes.)
+        ansible.builtin.replace:
+          path: /etc/fstab
+          regexp: '^(.*\sswap\s.*)$'
+          replace: '#\1'
+          backup: true
+
+      # At boot, automatically load these kernel modules
+
+      - name: Add kernel modules for Containerd
+        ansible.builtin.copy:
+          dest: /etc/modules-load.d/containerd.conf
+          content: |
+            overlay
+            br_netfilter
+
+
+      # Immediately loads the kernel modules into the current running system.
+      # Without this, the system would only load them after a reboot.
+
+      - name: Load kernel modules
+        ansible.builtin.shell: |
+          modprobe overlay
+          modprobe br_netfilter
+
+      - name: Set bridged iptables sysctl parameters(Redirects that output into the file /etc/sysctl.d/k8s.conf)
+        ansible.posix.sysctl:
+          name: "{{ param.name }}"
+          value: "{{ param.value }}"
+          state: present
+          sysctl_file: /etc/sysctl.d/k8s.conf
+        loop:
+          - {name: net.bridge.bridge-nf-call-ip6tables,   value: 1}
+          - {name: net.bridge.bridge-nf-call-iptables,    value: 1}
+        loop_control:
+          loop_var: param
+
+      - name: Enabling Bridge Firewall Rule
+        shell: "echo '1' > /proc/sys/net/ipv4/ip_forward"
+
+
+      - name: Enable ip forwarding
+        sysctl:
+          sysctl_file: /etc/sysctl.d/99-sysctl.conf
+          name: net.ipv4.ip_forward
+          value: "1"
+          state: present
+          reload: yes
+
+
+
+      # ---------------- Firewall (firewalld instead of ufw) ----------------
+      - name: Ensure firewalld is installed
+        yum:
+          name: firewalld
+          state: present
+
+      - name: Start and enable firewalld
+        ansible.builtin.systemd:
+          name: firewalld
+          state: started
+          enabled: true
+
+      - name: Open Kubernetes control plane ports
+        firewalld:
+          port: "{{ item }}"
+          permanent: yes
+          state: enabled
+          immediate: yes
+        with_items:
+          - 6443/tcp
+          - 2379-2380/tcp
+          - 10250/tcp
+          - 10257/tcp
+          - 10259/tcp
+
+      # ---------------- Kubernetes Repo ----------------
+      - name: Add Kubernetes repo
+        copy:
+          dest: /etc/yum.repos.d/kubernetes.repo
+          content: |
+            [kubernetes]
+            name=Kubernetes
+            baseurl=https://pkgs.k8s.io/core:/stable:/v1.34/rpm/
+            enabled=1
+            gpgcheck=1
+            gpgkey=https://pkgs.k8s.io/core:/stable:/v1.34/rpm/repodata/repomd.xml.key
+
+      - name: Install kubeadm, kubelet, kubectl
+        yum:
+          name:
+            - kubelet
+            - kubeadm
+            - kubectl
+          state: present
+
+
+      - name: Enable kubelet service
+        ansible.builtin.systemd:
+          name: kubelet
+          enabled: true
+          state: stopped  # kubeadm will start it
+
+      - name: Pull kubeadm container images
+        command: kubeadm config images pull
+
+
+      - name: Apply sysctl params
+        ansible.builtin.command: sysctl --system
+
+      - name: Configure containerd default config
+        ansible.builtin.shell: |
+          mkdir -p /etc/containerd
+          containerd config default > /etc/containerd/config.toml
+        args:
+          creates: /etc/containerd/config.toml
+
+
+      - name: Enable and restart containerd
+        ansible.builtin.systemd:
+          name: containerd
+          enabled: true
+          state: restarted
+
+      - name: Set SystemdCgroup = true in containerd config
+        ansible.builtin.replace:
+          path: /etc/containerd/config.toml
+          regexp: '^(\s*)SystemdCgroup = false'
+          replace: '\1SystemdCgroup = true'
+          backup: yes
+
+
+      - name: Initialize Kubernetes control plane
+        command: kubeadm init --apiserver-advertise-address 192.168.73.135 --pod-network-cidr=10.244.0.0/16
+        args:
+          creates: /etc/kubernetes/admin.conf
+        register: kubeadm_init
+
+
+      - name: Create kube config directory
+        file:
+          path: /home/ansible/.kube
+          state: directory
+          owner: ansible
+          group: ansible
+          mode: '0755'
+
+      - name: Copy admin.conf to user's kube config
+        copy:
+          src: /etc/kubernetes/admin.conf
+          dest: /home/ansible/.kube/config
+          remote_src: true
+          owner: ansible
+          group: ansible
+          mode: '0644'
+
+      - name: Generate join command
+        command: kubeadm token create --ttl 0 --print-join-command
+        register: join_cmd
+        environment:
+          KUBECONFIG: /home/ansible/.kube/config
+
+      - name: Save join command
+        copy:
+          dest: /tmp/kubeadm_join_token.sh
+          content: |
+            #!/bin/bash
+            {{ join_cmd.stdout }}
+          mode: '0755'
+
+      - name: Fetch join command to control node
+        fetch:
+          src: /tmp/kubeadm_join_token.sh
+          dest: ./kubeadm_join_token.sh
+          flat: yes
+      # ---------------- Install Calico CNI ----------------
+      - name: Install Calico CNI
+        command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+        environment:
+          KUBECONFIG: /home/ansible/.kube/config
+        args:
+          creates: /tmp/calico_installed
+
+      - name: Mark Calico as installed
+        file:
+          path: /tmp/calico_installed
+          state: touch
+
+      - name: Restart kubelet
+        ansible.builtin.systemd:
+          name: kubelet
+          state: restarted
+
+
+  handlers:
+    - name: Restart-docker
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+
+# tasks file for kubernetes_worker (CentOS 10)
+- name: Install Kubernetes Worker Node
+  hosts: worker
+  become: true
+  vars:
+    master_host: '192.168.73.135'
+  tasks:
+
+      - name: Remove old versions
+        yum:
+          name: "{{ pkg }}"
+          state: absent
+          disablerepo: docker-ce-stable
+        loop:
+          - docker
+          - docker-client
+          - docker-client-latest
+          - docker-common
+          - docker-latest
+          - docker-latest-logrotate
+          - docker-logrotate
+          - docker-engine
+          - runc
+          - podman
+          - kube*
+        loop_control:
+          loop_var: pkg
+      - name: Install required packages
+        yum:
+          name:
+            - curl
+            - gnupg2
+            - yum-utils
+            - dnf
+            - iproute-tc
+            - device-mapper-persistent-data
+            - lvm2
+            - ca-certificates
+          state: present
+
+      - name: Set up Docker repository
+        ansible.builtin.yum_repository:
+          name: docker-ce-stable
+          description: Docker CE Stable - $basearch
+          baseurl: https://download.docker.com/linux/centos/10/$basearch/stable
+          gpgcheck: yes
+          gpgkey: https://download.docker.com/linux/centos/gpg
+          enabled: yes
+
+      - name: Install Docker
+        yum:
+          name:
+            - docker-ce
+            - docker-ce-cli
+            - containerd.io
+            - docker-buildx-plugin
+            - docker-compose-plugin
+            - docker-ce-rootless-extras
+          state: present
+
+      - name: Start and enable Docker
+        ansible.builtin.systemd:
+          name: docker
+          enabled: true
+          state: started
+
+      - name: Configure Docker daemon.json(overwrite)
+        ansible.builtin.copy:
+          dest: /etc/docker/daemon.json
+          content: |
+            {
+              "exec-opts": ["native.cgroupdriver=systemd"],
+              "log-driver": "json-file",
+              "log-opts": {
+                "max-size": "100m"
+              }
+            }
+        notify: Restart-docker
+
+      - name: Disable swap
+        ansible.builtin.command: swapoff -a
+
+      - name: Comment out all swap entries in /etc/fstab(disables swap permanently for Kubernetes nodes.)
+        ansible.builtin.replace:
+          path: /etc/fstab
+          regexp: '^(.*\sswap\s.*)$'
+          replace: '#\1'
+          backup: true
+
+      - name: Add kernel modules for Containerd
+        ansible.builtin.copy:
+          dest: /etc/modules-load.d/containerd.conf
+          content: |
+            overlay
+            br_netfilter
+
+      - name: Load kernel modules
+        ansible.builtin.shell: |
+          modprobe overlay
+          modprobe br_netfilter
+
+      - name: Set bridged iptables sysctl parameters(Redirects that output into the file /etc/sysctl.d/k8s.conf)
+        ansible.posix.sysctl:
+          name: "{{ param.name }}"
+          value: "{{ param.value }}"
+          state: present
+          sysctl_file: /etc/sysctl.d/k8s.conf
+        loop:
+          - {name: net.bridge.bridge-nf-call-ip6tables,   value: 1}
+          - {name: net.bridge.bridge-nf-call-iptables,    value: 1}
+        loop_control:
+          loop_var: param
+
+
+      - name: Enabling Bridge Firewall Rule
+        shell: "echo '1' > /proc/sys/net/ipv4/ip_forward"
+
+
+      - name: Enable ip forwarding
+        sysctl:
+          sysctl_file: /etc/sysctl.d/99-sysctl.conf
+          name: net.ipv4.ip_forward
+          value: "1"
+          state: present
+          reload: yes
+
+
+
+      # ---------------- Firewall (firewalld instead of ufw) ----------------
+      - name: Ensure firewalld is installed
+        yum:
+          name: firewalld
+          state: present
+
+      - name: Start and enable firewalld
+        ansible.builtin.systemd:
+          name: firewalld
+          state: started
+          enabled: true
+
+      - name: Open Kubernetes worker node ports
+        firewalld:
+          port: "{{ item }}"
+          permanent: yes
+          state: enabled
+          immediate: yes
+        with_items:
+          - 22/tcp
+          - 10250/tcp
+          - 30000-32767/tcp   # NodePort services
+          - 10250/tcp
+
+      # ---------------- Kubernetes Repo ----------------
+      - name: Add Kubernetes repo
+        copy:
+          dest: /etc/yum.repos.d/kubernetes.repo
+          content: |
+            [kubernetes]
+            name=Kubernetes
+            baseurl=https://pkgs.k8s.io/core:/stable:/v1.34/rpm/
+            enabled=1
+            gpgcheck=1
+            gpgkey=https://pkgs.k8s.io/core:/stable:/v1.34/rpm/repodata/repomd.xml.key
+
+      - name: Install kubeadm, kubelet, kubectl
+        yum:
+          name:
+            - kubelet
+            - kubeadm
+            - kubectl
+          state: present
+
+      - name: Enable kubelet service
+        ansible.builtin.systemd:
+          name: kubelet
+          enabled: true
+          state: stopped  # kubeadm join will start it
+
+
+
+      - name: Restart kubelet
+        systemd:
+          name: kubelet
+          state: restarted
+          enabled: yes
+
+      - name: Apply sysctl params
+        ansible.builtin.command: sysctl --system
+
+      - name: Configure containerd default config
+        ansible.builtin.shell: |
+          mkdir -p /etc/containerd
+          containerd config default | sudo tee /etc/containerd/config.toml
+
+
+
+      - name: Enable and restart containerd
+        ansible.builtin.systemd:
+          name: containerd
+          enabled: true
+          state: restarted
+
+          
+      - name: Set SystemdCgroup = true in containerd config
+        ansible.builtin.replace:
+          path: /etc/containerd/config.toml
+          regexp: '^(\s*)SystemdCgroup = false'
+          replace: '\1SystemdCgroup = true'
+          backup: yes
+
+
+# workers already have Kubernetes configs and kubelet running from a previous join attempt,
+# which causes kubeadm join to fail with errors like:
+# kubelet.conf already exists
+# ca.crt already exists
+# Port 10250 is in use
+
+# Start the worker node fresh so it can re-join without conflicts.
+      - name: Reset worker node before joining (safe cleanup)
+        command: kubeadm reset -f
+        ignore_errors: true
+
+
+# Remove stale state that blocks a new join.
+      - name: Clean Kubernetes directories
+        file:
+          path: "{{ item }}"
+          state: absent
+        with_items:
+          - /etc/cni/net.d
+          - /var/lib/cni/
+          - /var/lib/kubelet
+          - /etc/kubernetes
+
+# Ensure a clean networking state before kubeadm sets up new rules.
+      - name: Flush iptables
+        command: iptables -F
+        ignore_errors: true
+
+      - name: Reboot the system
+        ansible.builtin.reboot:
+          msg: "Reboot initiated by Ansible for Kubernetes worker setup"
+          reboot_timeout: 150
+
+      - name: Copy join script from control node
+        copy:
+          src: ./kubeadm_join_token.sh
+          dest: /tmp/kubeadm_join_token.sh
+          mode: '0755'
+
+      - name: Join worker to cluster
+        command: bash /tmp/kubeadm_join_token.sh
+
+
+  handlers:
+    - name: Restart-docker
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
